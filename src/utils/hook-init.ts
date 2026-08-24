@@ -52,7 +52,9 @@ export function initHook(): Config | null {
     return null;
   }
 
-  if (!config.publicKey || !config.secretKey) {
+  // Under gateway auth the egress proxy injects the real Authorization header;
+  // loadConfig() substituted placeholder keys, so the check below must not gate.
+  if (!config.gatewayAuth && (!config.publicKey || !config.secretKey)) {
     error(
       "No Langfuse credentials set (CC_LANGFUSE_PUBLIC_KEY/CC_LANGFUSE_SECRET_KEY or LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)",
     );

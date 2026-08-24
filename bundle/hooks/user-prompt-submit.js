@@ -4330,14 +4330,17 @@ function groupIntoTurns(messages) {
         startTime: merged.startTime,
         endTime: merged.endTime,
         toolCalls,
-        stopReason: merged.stopReason
+        stopReason: merged.stopReason,
+        messageId: msgId === "__no_id__" ? void 0 : msgId
       });
     }
     turns.push({
       userContent: currentUser.message.content,
       userTimestamp: currentUser.timestamp,
       llmCalls,
-      isComplete
+      isComplete,
+      promptId: currentPromptId ?? void 0,
+      userUuid: currentUser.uuid
     });
   }
   for (const msg of messages) {
@@ -4372,8 +4375,13 @@ function groupIntoTurns(messages) {
 
 // dist/langfuse.js
 var client = null;
+var sdkErrors = [];
 function initClient(publicKey, secretKey, baseUrl) {
   client = new Langfuse({ publicKey, secretKey, baseUrl });
+  client.on("error", (err) => {
+    sdkErrors.push(String(err).slice(0, 500));
+    error(`Langfuse SDK error: ${err}`);
+  });
   return client;
 }
 async function flushTraces() {
@@ -4421,17 +4429,29 @@ function buildUsage(usage) {
   }
   return Object.keys(details).length > 0 ? details : void 0;
 }
+function extractSenderIds(userText) {
+  const out = [];
+  const re = /\bsender_id="([^"]+)"/g;
+  let m;
+  while ((m = re.exec(userText)) !== null) {
+    if (!out.includes(m[1]))
+      out.push(m[1]);
+  }
+  return out;
+}
 function emitTurn(options) {
-  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes } = options;
+  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes, promptRef } = options;
   if (!client)
     throw new Error("Langfuse client not initialized \u2014 call initClient() first");
   const traceName = `Claude Code - Turn ${turnNum}`;
   const userText = typeof turn.userContent === "string" ? truncate(turn.userContent) : JSON.stringify(turn.userContent);
   const finalText = turn.llmCalls.length > 0 ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content)) : "";
+  const senders = extractSenderIds(typeof turn.userContent === "string" ? turn.userContent : JSON.stringify(turn.userContent));
   const trace = client.trace({
-    id: traceId || randomUUID(),
+    id: traceId || turn.userUuid || randomUUID(),
     name: traceName,
     sessionId,
+    userId: senders[0],
     input: { role: "user", content: userText },
     output: { role: "assistant", content: finalText },
     tags: ["claude-code"],
@@ -4439,15 +4459,19 @@ function emitTurn(options) {
       source: "claude-code",
       turn_number: turnNum,
       transcript: transcriptName,
-      is_complete: turn.isComplete
+      is_complete: turn.isComplete,
+      // The join key for "which chat message produced this trace" — the CLI's
+      // per-user-prompt id, matched against the runner's per-submission record.
+      ...turn.promptId ? { prompt_id: turn.promptId } : {},
+      ...senders.length > 1 ? { other_senders: senders.slice(1) } : {}
     }
   });
   for (let i = 0; i < turn.llmCalls.length; i++) {
-    emitLLMCall(trace, i + 1, turn.llmCalls.length, turn.llmCalls[i], userText, toolStartTimes);
+    emitLLMCall(trace, i + 1, turn.llmCalls.length, turn.llmCalls[i], userText, toolStartTimes, promptRef);
   }
   return trace.id;
 }
-function emitLLMCall(trace, index, total, llm, userText, toolStartTimes) {
+function emitLLMCall(trace, index, total, llm, userText, toolStartTimes, promptRef) {
   const genName = total > 1 ? `LLM Call ${index}/${total}` : "Claude Response";
   const text = truncate(extractText(llm.content));
   const thinking = extractThinking(llm.content);
@@ -4462,11 +4486,17 @@ function emitLLMCall(trace, index, total, llm, userText, toolStartTimes) {
   }
   const usage = buildUsage(llm.usage);
   const gen = trace.generation({
+    // Deterministic: the API message id shared by this call's streaming chunks,
+    // so a re-ingest upserts. Undefined lets the SDK generate one.
+    id: llm.messageId,
     name: genName,
     model: llm.model,
     input: { role: "user", content: userText },
     output,
     usage,
+    // langfuse@3 unwraps this to promptName/promptVersion and deliberately
+    // skips the link for a fallback prompt — isFallback must be false.
+    ...promptRef ? { prompt: { name: promptRef.name, version: promptRef.version, isFallback: false } } : {},
     metadata: {
       stop_reason: llm.stopReason ?? "",
       timestamp: llm.endTime,
@@ -4500,6 +4530,8 @@ function emitTool(parent, tc, toolStartTimes) {
   const startTime = wallClockStart ? new Date(wallClockStart) : void 0;
   const endTime = tc.result?.timestamp ? new Date(tc.result.timestamp) : void 0;
   const span = parent.span({
+    // Deterministic: the model-minted tool_use_id, so a re-ingest upserts.
+    id: tc.tool_use.id,
     name: `Tool: ${tc.tool_use.name}`,
     input: toolInput,
     output: toolOutput,
@@ -4640,14 +4672,30 @@ var SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1e3;
 
 // dist/config.js
 function loadConfig() {
-  const publicKey = process.env.CC_LANGFUSE_PUBLIC_KEY ?? process.env.LANGFUSE_PUBLIC_KEY ?? "";
-  const secretKey = process.env.CC_LANGFUSE_SECRET_KEY ?? process.env.LANGFUSE_SECRET_KEY ?? "";
+  const gatewayAuth = (process.env.CC_LANGFUSE_GATEWAY_AUTH ?? "").toLowerCase() === "true";
+  const seamMode = (process.env.CC_LANGFUSE_SEAM_MODE ?? "").toLowerCase() === "true";
+  const publicKey = process.env.CC_LANGFUSE_PUBLIC_KEY ?? process.env.LANGFUSE_PUBLIC_KEY ?? (gatewayAuth ? "gateway" : "");
+  const secretKey = process.env.CC_LANGFUSE_SECRET_KEY ?? process.env.LANGFUSE_SECRET_KEY ?? (gatewayAuth ? "gateway" : "");
   const baseUrl = process.env.CC_LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASE_URL ?? "https://cloud.langfuse.com";
   const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "";
   const stateFilePath = process.env.STATE_FILE ?? `${homeDir}/.claude/state/langfuse_state.json`;
   const debug2 = (process.env.CC_LANGFUSE_DEBUG ?? "").toLowerCase() === "true";
   const maxChars2 = parseInt(process.env.CC_LANGFUSE_MAX_CHARS ?? "50000", 10);
-  return { publicKey, secretKey, baseUrl, stateFilePath, debug: debug2, maxChars: maxChars2 };
+  const promptName = process.env.CC_LANGFUSE_PROMPT_NAME || void 0;
+  const promptVersionRaw = parseInt(process.env.CC_LANGFUSE_PROMPT_VERSION ?? "", 10);
+  const promptVersion = Number.isFinite(promptVersionRaw) ? promptVersionRaw : void 0;
+  return {
+    publicKey,
+    secretKey,
+    baseUrl,
+    stateFilePath,
+    debug: debug2,
+    maxChars: maxChars2,
+    gatewayAuth,
+    seamMode,
+    promptName,
+    promptVersion
+  };
 }
 
 // dist/utils/hook-init.js
@@ -4666,7 +4714,7 @@ function initHook() {
   if (!shouldTrace(process.env)) {
     return null;
   }
-  if (!config.publicKey || !config.secretKey) {
+  if (!config.gatewayAuth && (!config.publicKey || !config.secretKey)) {
     error("No Langfuse credentials set (CC_LANGFUSE_PUBLIC_KEY/CC_LANGFUSE_SECRET_KEY or LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)");
     return null;
   }

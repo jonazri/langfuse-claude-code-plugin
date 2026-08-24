@@ -20,11 +20,28 @@ import {
   tracePendingSubagents,
   flushTraces,
   shutdownClient,
+  getSdkErrors,
 } from "../langfuse.js";
 import { initHook, expandHome } from "../utils/hook-init.js";
 import { readStdin } from "../utils/stdin.js";
 import { isFeedbackCommand } from "../scoring/match.js";
 import type { StopHookInput, ContentBlock } from "../types.js";
+
+/**
+ * Machine-readable outcome line on stdout — the ONLY reliable success signal:
+ * every exit path here returns 0 (Claude Code must not be affected), per-turn
+ * failures are caught in the emit loop, and the SDK swallows flush errors.
+ * A driving runner parses this line into its upload-outcome record.
+ */
+function printOutcome(turnsTraced: number, turnsFailed: number, flush: string, errors?: string[]): void {
+  const outcome: Record<string, unknown> = {
+    turns_traced: turnsTraced,
+    turns_failed: turnsFailed,
+    flush,
+  };
+  if (errors && errors.length > 0) outcome.errors = errors.slice(0, 3);
+  console.log(`LANGFUSE_UPLOAD_OUTCOME ${JSON.stringify(outcome)}`);
+}
 
 async function main(): Promise<void> {
   const startTime = Date.now();
@@ -32,13 +49,17 @@ async function main(): Promise<void> {
   const input: StopHookInput = await readStdin();
 
   const config = initHook();
-  if (!config) return;
+  if (!config) {
+    printOutcome(0, 0, "skipped:gate");
+    return;
+  }
 
   debug(`Stop hook started, session=${input.session_id}`);
 
   // Skip recursive hook calls.
   if (input.stop_hook_active) {
     debug("stop_hook_active=true, skipping");
+    printOutcome(0, 0, "skipped:recursive");
     return;
   }
 
@@ -46,6 +67,7 @@ async function main(): Promise<void> {
   const transcriptPath = expandHome(input.transcript_path);
   if (!input.session_id || !transcriptPath) {
     warn(`Invalid input: session=${input.session_id}, transcript=${transcriptPath}`);
+    printOutcome(0, 0, "skipped:invalid-input");
     return;
   }
 
@@ -70,6 +92,7 @@ async function main(): Promise<void> {
         return { ...s, [input.session_id]: { ...ss, current_trace_id: undefined } };
       });
     }
+    printOutcome(0, 0, "ok");
     return;
   }
 
@@ -77,7 +100,12 @@ async function main(): Promise<void> {
   // the prompt was a /feedback or /journey command), there's nothing to emit.
   // Just advance last_line past the feedback turn so the next Stop doesn't
   // reprocess it.
-  if (!sessionState.current_trace_id) {
+  //
+  // Seam mode is the exception: no UserPromptSubmit hook runs at all, so
+  // current_trace_id is never set — emitTurn mints a deterministic id from the
+  // turn's user-row transcript uuid instead, and this branch must not swallow
+  // every turn.
+  if (!sessionState.current_trace_id && !config.seamMode) {
     debug(
       `No current_trace_id — likely a feedback turn. ` +
         `Advancing last_line ${sessionState.last_line} → ${lastLine} and exiting.`,
@@ -89,6 +117,7 @@ async function main(): Promise<void> {
         [input.session_id]: { ...ss, last_line: lastLine, updated: new Date().toISOString() },
       };
     });
+    printOutcome(0, 0, "skipped:feedback-turn");
     return;
   }
 
@@ -120,8 +149,13 @@ async function main(): Promise<void> {
   }
 
   let tracedTurns = 0;
+  let failedTurns = 0;
   const currentTraceId = sessionState.current_trace_id;
   const transcriptName = transcriptPath.split("/").pop() ?? "";
+  const promptRef =
+    config.promptName && config.promptVersion !== undefined
+      ? { name: config.promptName, version: config.promptVersion }
+      : undefined;
 
   for (let i = 0; i < turns.length; i++) {
     const turn = turns[i];
@@ -139,9 +173,11 @@ async function main(): Promise<void> {
         transcriptName,
         traceId,
         toolStartTimes: isLastTurn ? sessionState.tool_start_times : undefined,
+        promptRef,
       });
       tracedTurns++;
     } catch (err) {
+      failedTurns++;
       error(`Failed to trace turn ${turnNum}: ${err}`);
     }
   }
@@ -204,9 +240,19 @@ async function main(): Promise<void> {
     return pruneOldSessions(updatedState);
   });
 
-  // Flush outside the lock
-  await flushTraces();
-  await shutdownClient();
+  // Flush outside the lock. flushAsync resolves even on ingestion errors, so
+  // the outcome's flush field reads the SDK "error" events instead.
+  let flushOutcome = "ok";
+  try {
+    await flushTraces();
+    await shutdownClient();
+  } catch (err) {
+    flushOutcome = "error";
+    error(`Flush failed: ${err}`);
+  }
+  const sdkErrors = getSdkErrors();
+  if (sdkErrors.length > 0 && flushOutcome === "ok") flushOutcome = "error";
+  printOutcome(tracedTurns, failedTurns, flushOutcome, sdkErrors);
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
   log(`Processed ${tracedTurns} turns in ${duration}s`);
@@ -219,6 +265,7 @@ async function main(): Promise<void> {
 main().catch((err) => {
   try {
     error(`Stop hook fatal error: ${err}`);
+    printOutcome(0, 0, "fatal", [String(err).slice(0, 500)]);
   } catch {
     // Last resort
   }

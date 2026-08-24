@@ -4101,8 +4101,13 @@ var MAX_FULL_READ_BYTES = 50 * 1024 * 1024;
 
 // dist/langfuse.js
 var client = null;
+var sdkErrors = [];
 function initClient(publicKey, secretKey, baseUrl) {
   client = new Langfuse({ publicKey, secretKey, baseUrl });
+  client.on("error", (err) => {
+    sdkErrors.push(String(err).slice(0, 500));
+    error(`Langfuse SDK error: ${err}`);
+  });
   return client;
 }
 async function flushTraces() {
@@ -4200,14 +4205,30 @@ var SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1e3;
 
 // dist/config.js
 function loadConfig() {
-  const publicKey = process.env.CC_LANGFUSE_PUBLIC_KEY ?? process.env.LANGFUSE_PUBLIC_KEY ?? "";
-  const secretKey = process.env.CC_LANGFUSE_SECRET_KEY ?? process.env.LANGFUSE_SECRET_KEY ?? "";
+  const gatewayAuth = (process.env.CC_LANGFUSE_GATEWAY_AUTH ?? "").toLowerCase() === "true";
+  const seamMode = (process.env.CC_LANGFUSE_SEAM_MODE ?? "").toLowerCase() === "true";
+  const publicKey = process.env.CC_LANGFUSE_PUBLIC_KEY ?? process.env.LANGFUSE_PUBLIC_KEY ?? (gatewayAuth ? "gateway" : "");
+  const secretKey = process.env.CC_LANGFUSE_SECRET_KEY ?? process.env.LANGFUSE_SECRET_KEY ?? (gatewayAuth ? "gateway" : "");
   const baseUrl = process.env.CC_LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASE_URL ?? "https://cloud.langfuse.com";
   const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "";
   const stateFilePath = process.env.STATE_FILE ?? `${homeDir}/.claude/state/langfuse_state.json`;
   const debug2 = (process.env.CC_LANGFUSE_DEBUG ?? "").toLowerCase() === "true";
   const maxChars = parseInt(process.env.CC_LANGFUSE_MAX_CHARS ?? "50000", 10);
-  return { publicKey, secretKey, baseUrl, stateFilePath, debug: debug2, maxChars };
+  const promptName = process.env.CC_LANGFUSE_PROMPT_NAME || void 0;
+  const promptVersionRaw = parseInt(process.env.CC_LANGFUSE_PROMPT_VERSION ?? "", 10);
+  const promptVersion = Number.isFinite(promptVersionRaw) ? promptVersionRaw : void 0;
+  return {
+    publicKey,
+    secretKey,
+    baseUrl,
+    stateFilePath,
+    debug: debug2,
+    maxChars,
+    gatewayAuth,
+    seamMode,
+    promptName,
+    promptVersion
+  };
 }
 
 // dist/utils/hook-init.js
@@ -4226,7 +4247,7 @@ function initHook() {
   if (!shouldTrace(process.env)) {
     return null;
   }
-  if (!config.publicKey || !config.secretKey) {
+  if (!config.gatewayAuth && (!config.publicKey || !config.secretKey)) {
     error("No Langfuse credentials set (CC_LANGFUSE_PUBLIC_KEY/CC_LANGFUSE_SECRET_KEY or LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY)");
     return null;
   }

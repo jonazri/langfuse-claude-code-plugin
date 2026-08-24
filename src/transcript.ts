@@ -349,6 +349,7 @@ export function groupIntoTurns(messages: TranscriptMessage[]): Turn[] {
         endTime: merged.endTime,
         toolCalls,
         stopReason: merged.stopReason,
+        messageId: msgId === "__no_id__" ? undefined : msgId,
       });
     }
 
@@ -357,6 +358,8 @@ export function groupIntoTurns(messages: TranscriptMessage[]): Turn[] {
       userTimestamp: currentUser.timestamp,
       llmCalls,
       isComplete,
+      promptId: currentPromptId ?? undefined,
+      userUuid: currentUser.uuid,
     });
   }
 

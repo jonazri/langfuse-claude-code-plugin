@@ -24,8 +24,21 @@ import * as logger from "./logger.js";
 
 let client: Langfuse | null = null;
 
+/** SDK-reported ingestion/network errors this invocation. flushAsync() swallows
+ *  them (it resolves on error), so the "error" event is the only reliable
+ *  signal — the machine-readable outcome line reads this. */
+const sdkErrors: string[] = [];
+
+export function getSdkErrors(): string[] {
+  return sdkErrors;
+}
+
 export function initClient(publicKey: string, secretKey: string, baseUrl: string): Langfuse {
   client = new Langfuse({ publicKey, secretKey, baseUrl });
+  client.on("error", (err: unknown) => {
+    sdkErrors.push(String(err).slice(0, 500));
+    logger.error(`Langfuse SDK error: ${err}`);
+  });
   return client;
 }
 
@@ -136,6 +149,20 @@ export interface EmitTurnOptions {
   traceId?: string;
   /** Tool start times from PreToolUse (tool_use_id -> wall-clock ms). */
   toolStartTimes?: Record<string, number>;
+  /** Registered prompt to link on every generation (promptName/promptVersion). */
+  promptRef?: { name: string; version: number };
+}
+
+/** First `sender_id="…"` embedded in the formatted user content is the turn's
+ *  author; a batch can carry several — the rest are tagged in metadata. */
+export function extractSenderIds(userText: string): string[] {
+  const out: string[] = [];
+  const re = /\bsender_id="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(userText)) !== null) {
+    if (!out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
 }
 
 /**
@@ -143,7 +170,7 @@ export interface EmitTurnOptions {
  * Returns the trace ID used.
  */
 export function emitTurn(options: EmitTurnOptions): string {
-  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes } = options;
+  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes, promptRef } = options;
 
   if (!client) throw new Error("Langfuse client not initialized — call initClient() first");
 
@@ -157,11 +184,20 @@ export function emitTurn(options: EmitTurnOptions): string {
       ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content))
       : "";
 
-  // Create or update the trace (upsert if traceId provided)
+  // Per-turn author from the sender_id embedded in the user content; a batch
+  // may carry several senders — first is the userId, the rest ride metadata.
+  const senders = extractSenderIds(
+    typeof turn.userContent === "string" ? turn.userContent : JSON.stringify(turn.userContent),
+  );
+
+  // Create or update the trace (upsert if traceId provided). Without a
+  // pre-allocated id, derive it from the user row's transcript uuid so
+  // re-ingesting the same transcript upserts instead of duplicating.
   const trace = client.trace({
-    id: traceId || randomUUID(),
+    id: traceId || turn.userUuid || randomUUID(),
     name: traceName,
     sessionId,
+    userId: senders[0],
     input: { role: "user", content: userText },
     output: { role: "assistant", content: finalText },
     tags: ["claude-code"],
@@ -170,11 +206,23 @@ export function emitTurn(options: EmitTurnOptions): string {
       turn_number: turnNum,
       transcript: transcriptName,
       is_complete: turn.isComplete,
+      // The join key for "which chat message produced this trace" — the CLI's
+      // per-user-prompt id, matched against the runner's per-submission record.
+      ...(turn.promptId ? { prompt_id: turn.promptId } : {}),
+      ...(senders.length > 1 ? { other_senders: senders.slice(1) } : {}),
     },
   });
 
   for (let i = 0; i < turn.llmCalls.length; i++) {
-    emitLLMCall(trace, i + 1, turn.llmCalls.length, turn.llmCalls[i], userText, toolStartTimes);
+    emitLLMCall(
+      trace,
+      i + 1,
+      turn.llmCalls.length,
+      turn.llmCalls[i],
+      userText,
+      toolStartTimes,
+      promptRef,
+    );
   }
 
   return trace.id;
@@ -189,6 +237,7 @@ function emitLLMCall(
   llm: LLMCall,
   userText: string,
   toolStartTimes?: Record<string, number>,
+  promptRef?: { name: string; version: number },
 ): void {
   const genName = total > 1 ? `LLM Call ${index}/${total}` : "Claude Response";
 
@@ -207,11 +256,17 @@ function emitLLMCall(
   const usage = buildUsage(llm.usage);
 
   const gen = trace.generation({
+    // Deterministic: the API message id shared by this call's streaming chunks,
+    // so a re-ingest upserts. Undefined lets the SDK generate one.
+    id: llm.messageId,
     name: genName,
     model: llm.model,
     input: { role: "user", content: userText },
     output,
     usage,
+    // langfuse@3 unwraps this to promptName/promptVersion and deliberately
+    // skips the link for a fallback prompt — isFallback must be false.
+    ...(promptRef ? { prompt: { name: promptRef.name, version: promptRef.version, isFallback: false } } : {}),
     metadata: {
       stop_reason: llm.stopReason ?? "",
       timestamp: llm.endTime,
@@ -259,6 +314,8 @@ function emitTool(parent: any, tc: ToolCall, toolStartTimes?: Record<string, num
   const endTime = tc.result?.timestamp ? new Date(tc.result.timestamp) : undefined;
 
   const span = parent.span({
+    // Deterministic: the model-minted tool_use_id, so a re-ingest upserts.
+    id: tc.tool_use.id,
     name: `Tool: ${tc.tool_use.name}`,
     input: toolInput,
     output: toolOutput,
@@ -405,8 +462,10 @@ export function tracePendingSubagents(options: {
 
       const subagentTurns = groupIntoTurns(subagentMessages);
 
-      // Create a grouping span for all subagent turns
+      // Create a grouping span for all subagent turns. Deterministic id from
+      // the agent_id so a re-ingest upserts the structure too.
       const subagentSpan = parentTrace.span({
+        id: `${subagent.agent_id}-group`,
         name: `${toolName} Subagent`,
         metadata: {
           agent_id: subagent.agent_id,
@@ -427,6 +486,7 @@ export function tracePendingSubagents(options: {
             : "";
 
         const turnSpan = subagentSpan.span({
+          id: turn.userUuid ? `${subagent.agent_id}-turn-${turn.userUuid}` : undefined,
           name: `Subagent Turn ${i + 1}`,
           input: { role: "user", content: userText },
           output: { role: "assistant", content: finalText },

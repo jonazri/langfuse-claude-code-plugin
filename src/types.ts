@@ -80,6 +80,8 @@ export interface UserMessage {
   };
   timestamp: string;
   promptId?: string;
+  /** Transcript entry uuid — basis for deterministic trace ids. */
+  uuid?: string;
 }
 
 /** A tool result message in the transcript (also role: "user"). */
@@ -147,6 +149,9 @@ export interface LLMCall {
   stopReason?: string | null;
   /** True if this LLM call was synthesized (not from the transcript). */
   synthetic?: boolean;
+  /** API message id shared by this call's streaming chunks — basis for a
+   *  deterministic generation id. */
+  messageId?: string;
 }
 
 /** A complete turn: one user prompt → one or more LLM calls. */
@@ -156,6 +161,10 @@ export interface Turn {
   llmCalls: LLMCall[];
   /** Whether the turn is complete (has stop_reason: "end_turn"). */
   isComplete: boolean;
+  /** The CLI's per-user-prompt id, from the transcript user row. */
+  promptId?: string;
+  /** The user row's transcript uuid — deterministic trace-id basis. */
+  userUuid?: string;
 }
 
 // ─── Tracing State ─────────────────────────────────────────────────────────
