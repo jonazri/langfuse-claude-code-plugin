@@ -4836,6 +4836,7 @@ async function main() {
   }
   let tracedTurns = 0;
   let failedTurns = 0;
+  let lastEmittedTraceId;
   const currentTraceId = sessionState.current_trace_id;
   const transcriptName = transcriptPath.split("/").pop() ?? "";
   const promptRef = config.promptName && config.promptVersion !== void 0 ? { name: config.promptName, version: config.promptVersion } : void 0;
@@ -4845,7 +4846,7 @@ async function main() {
     const turnNum = sessionState.turn_count + tracedTurns + 1;
     const traceId = isLastTurn ? currentTraceId : void 0;
     try {
-      emitTurn({
+      lastEmittedTraceId = emitTurn({
         sessionId: input.session_id,
         turnNum,
         turn,
@@ -4870,7 +4871,9 @@ async function main() {
       sessionId: input.session_id,
       pendingSubagents,
       taskRunMap: mergedTaskRunMap,
-      parentTraceId: freshSession.current_trace_id
+      // Seam mode: current_trace_id is never allocated — parent under the last
+      // minted trace instead.
+      parentTraceId: freshSession.current_trace_id ?? lastEmittedTraceId
     });
   }
   let promoteTraceId = void 0;

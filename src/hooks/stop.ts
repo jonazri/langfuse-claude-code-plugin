@@ -150,6 +150,9 @@ async function main(): Promise<void> {
 
   let tracedTurns = 0;
   let failedTurns = 0;
+  // Seam mode mints trace ids inside emitTurn, so the subagent pass below
+  // cannot rely on current_trace_id — track the last successfully emitted one.
+  let lastEmittedTraceId: string | undefined;
   const currentTraceId = sessionState.current_trace_id;
   const transcriptName = transcriptPath.split("/").pop() ?? "";
   const promptRef =
@@ -166,7 +169,7 @@ async function main(): Promise<void> {
     const traceId = isLastTurn ? currentTraceId : undefined;
 
     try {
-      emitTurn({
+      lastEmittedTraceId = emitTurn({
         sessionId: input.session_id,
         turnNum,
         turn,
@@ -194,7 +197,9 @@ async function main(): Promise<void> {
       sessionId: input.session_id,
       pendingSubagents,
       taskRunMap: mergedTaskRunMap,
-      parentTraceId: freshSession.current_trace_id,
+      // Seam mode: current_trace_id is never allocated — parent under the last
+      // minted trace instead.
+      parentTraceId: freshSession.current_trace_id ?? lastEmittedTraceId,
     });
   }
 
