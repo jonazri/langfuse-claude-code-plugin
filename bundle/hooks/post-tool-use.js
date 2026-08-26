@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);
 
 // dist/hooks/post-tool-use.js
 import { randomUUID } from "node:crypto";

@@ -1,63 +1,83 @@
 /**
- * Langfuse run construction and submission.
+ * Langfuse run construction and submission — JS/TS SDK v5 (OTLP ingestion).
  *
- * Converts parsed Turns into Langfuse trace hierarchies:
- *   Trace (Turn)
- *   ├── Generation: "LLM Call 1/3"  (model, usage, thinking)
- *   │    ├── Span: "Tool: Glob"     (input, output, duration)
- *   │    └── Span: "Tool: Read"
+ * Converts parsed Turns into observation trees:
+ *   Agent (Turn root — carries the turn's input/output, v5 root-IO model)
+ *   ├── Generation: "LLM Call 1/3"  (model, usage, thinking, prompt link)
+ *   │    ├── Tool: Glob             (input, output, duration)
+ *   │    └── Tool: Read
  *   ├── Generation: "LLM Call 2/3"
- *   │    └── Span: "Tool: Edit"
  *   └── Generation: "LLM Call 3/3"  (final response)
  *
- * Tools are nested under their parent generation (not siblings),
- * preserving the causal relationship between LLM calls and tool use.
+ * v5 semantics honored here:
+ *   - Correlating attributes (userId, sessionId, metadata) ride EVERY
+ *     observation via propagateAttributes — the observations-first model.
+ *   - The turn's overall input/output live on the ROOT observation; trace
+ *     input/output is deprecated and not written.
+ *   - Ingestion is OTLP (`/api/public/otel/v1/traces`, version-4 header) via
+ *     FetchOtlpExporter — classic `/api/public/ingestion` trace events are
+ *     removed from Langfuse Cloud on 2026-11-16.
+ *   - The trace id stays deterministic (transcript user-row uuid) through
+ *     QueuedIdGenerator; observation ids are OTEL span ids, so the duplicate
+ *     guard is the state file's line offsets, as in the pre-fork plugin.
  */
-
-import Langfuse from "langfuse";
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import { LangfuseClient } from "@langfuse/client";
+import { LangfuseSpanProcessor } from "@langfuse/otel";
+import { propagateAttributes, startObservation } from "@langfuse/tracing";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { TraceFlags, type SpanContext } from "@opentelemetry/api";
 import type { Turn, LLMCall, ToolCall, Usage, SessionState } from "./types.js";
 import { readTranscript, groupIntoTurns, extractText, extractThinking } from "./transcript.js";
+import { FetchOtlpExporter, QueuedIdGenerator, deriveTraceId, getTransportErrors } from "./otel-exporter.js";
 import * as logger from "./logger.js";
 
 // ─── Client setup ───────────────────────────────────────────────────────────
 
-let client: Langfuse | null = null;
-
-/** SDK-reported ingestion/network errors this invocation. flushAsync() swallows
- *  them (it resolves on error), so the "error" event is the only reliable
- *  signal — the machine-readable outcome line reads this. */
-const sdkErrors: string[] = [];
+let provider: NodeTracerProvider | null = null;
+let processor: LangfuseSpanProcessor | null = null;
+let idGenerator: QueuedIdGenerator | null = null;
+let apiClient: LangfuseClient | null = null;
 
 export function getSdkErrors(): string[] {
-  return sdkErrors;
+  return getTransportErrors();
 }
 
-export function initClient(publicKey: string, secretKey: string, baseUrl: string): Langfuse {
-  client = new Langfuse({ publicKey, secretKey, baseUrl });
-  client.on("error", (err: unknown) => {
-    sdkErrors.push(String(err).slice(0, 500));
-    logger.error(`Langfuse SDK error: ${err}`);
+export function initClient(publicKey: string, secretKey: string, baseUrl: string): void {
+  idGenerator = new QueuedIdGenerator();
+  processor = new LangfuseSpanProcessor({
+    publicKey,
+    secretKey,
+    baseUrl,
+    exporter: new FetchOtlpExporter({ baseUrl, publicKey, secretKey }),
   });
-  return client;
+  provider = new NodeTracerProvider({ idGenerator, spanProcessors: [processor] });
+  provider.register();
+  // Non-tracing API (scores) — fetch-based, so it traverses the same proxy.
+  apiClient = new LangfuseClient({ publicKey, secretKey, baseUrl });
 }
 
-/** Flush all pending events to ensure traces are sent before hook exits. */
+/** Flush all pending spans so traces are sent before the hook exits. */
 export async function flushTraces(): Promise<void> {
-  if (!client) {
-    logger.warn("Cannot flush: client not initialized");
+  if (!processor) {
+    logger.warn("Cannot flush: processor not initialized");
     return;
   }
-  logger.debug("Flushing Langfuse traces...");
-  await client.flushAsync();
-  logger.debug("Langfuse traces flushed");
+  logger.debug("Flushing Langfuse spans...");
+  await processor.forceFlush();
+  logger.debug("Langfuse spans flushed");
 }
 
-/** Shut down the Langfuse client (flushes remaining events). */
+/** Shut down the provider (flushes remaining spans and pending scores). */
 export async function shutdownClient(): Promise<void> {
-  if (!client) return;
   try {
-    await client.shutdownAsync();
+    await apiClient?.flush();
+  } catch {
+    // Best-effort — score delivery failures surface via the outcome line
+  }
+  if (!provider) return;
+  try {
+    await provider.shutdown();
   } catch {
     // Best-effort shutdown
   }
@@ -81,15 +101,16 @@ export interface PostScoreOptions {
 }
 
 /**
- * Post a score to Langfuse. Idempotent on `id` — same id with new value/comment
- * upserts the existing row.
+ * Post a score. Idempotent on `id`. Score writes remain a supported ingestion
+ * event type after the v4 cutover (deprecated-API guide) — no direct REST
+ * workaround needed.
  */
 export function postScore(options: PostScoreOptions): void {
-  if (!client) {
+  if (!apiClient) {
     logger.warn("Cannot post score: client not initialized");
     return;
   }
-  client.score({
+  apiClient.score.create({
     id: options.id,
     name: options.name,
     value: options.value,
@@ -97,6 +118,15 @@ export function postScore(options: PostScoreOptions): void {
     traceId: options.traceId,
     sessionId: options.sessionId,
   });
+}
+
+/** Flush pending score writes (separate pipeline from the span processor). */
+export async function flushScores(): Promise<void> {
+  try {
+    await apiClient?.flush();
+  } catch (err) {
+    logger.error(`Score flush failed: ${err}`);
+  }
 }
 
 // ─── Truncation ─────────────────────────────────────────────────────────────
@@ -127,11 +157,12 @@ function truncateValue(v: unknown): unknown {
 
 // ─── Usage formatting ───────────────────────────────────────────────────────
 
-/** Build usage object for Langfuse generation. */
 function buildUsage(usage: Usage): Record<string, number> | undefined {
   const details: Record<string, number> = {};
   if (usage.input_tokens > 0) details.input = usage.input_tokens;
   if (usage.output_tokens > 0) details.output = usage.output_tokens;
+  if (usage.cache_read_input_tokens) details.cache_read_input_tokens = usage.cache_read_input_tokens;
+  if (usage.cache_creation_input_tokens) details.cache_creation_input_tokens = usage.cache_creation_input_tokens;
   if (usage.input_tokens > 0 || usage.output_tokens > 0) {
     details.total = (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
   }
@@ -145,12 +176,15 @@ export interface EmitTurnOptions {
   turnNum: number;
   turn: Turn;
   transcriptName: string;
-  /** Pre-allocated trace ID from UserPromptSubmit. */
+  /** Pre-allocated trace ID (32-hex or uuid) from UserPromptSubmit. */
   traceId?: string;
   /** Tool start times from PreToolUse (tool_use_id -> wall-clock ms). */
   toolStartTimes?: Record<string, number>;
   /** Registered prompt to link on every generation (promptName/promptVersion). */
   promptRef?: { name: string; version: number };
+  /** Extra trace-level metadata (e.g. interrupted: "true"). Values must be
+   *  strings — propagateAttributes requires Record<string, string>. */
+  extraMetadata?: Record<string, string>;
 }
 
 /** First `sender_id="…"` embedded in the formatted user content is the turn's
@@ -165,73 +199,104 @@ export function extractSenderIds(userText: string): string[] {
   return out;
 }
 
+/** Root span context of the most recent emitTurn — the parent for the
+ *  subagent pass (v3 could re-open a trace by id; OTLP cannot). The turn's
+ *  correlating attributes ride along so the subagent pass can re-establish
+ *  the propagation scope: its spans are part of the same trace and its
+ *  generations are cost-bearing, so session cost must include them. */
+let lastRootSpanContext: SpanContext | null = null;
+let lastRootPropagation: { sessionId: string; userId?: string } | null = null;
+
+function toDate(iso: string): Date {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? new Date() : d;
+}
+
 /**
- * Emit one turn as a Langfuse trace with nested generation and tool observations.
- * Returns the trace ID used.
+ * Emit one turn as a trace: an agent-typed root observation carrying the
+ * turn's input/output, with nested generations and tool observations.
+ * Returns the (deterministic) 32-hex trace ID used.
  */
 export function emitTurn(options: EmitTurnOptions): string {
-  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes, promptRef } = options;
+  const { sessionId, turnNum, turn, transcriptName, traceId, toolStartTimes, promptRef, extraMetadata } = options;
 
-  if (!client) throw new Error("Langfuse client not initialized — call initClient() first");
+  if (!idGenerator) throw new Error("Langfuse tracing not initialized — call initClient() first");
 
   const traceName = `Claude Code - Turn ${turnNum}`;
   const userText =
-    typeof turn.userContent === "string"
-      ? truncate(turn.userContent)
-      : JSON.stringify(turn.userContent);
+    typeof turn.userContent === "string" ? truncate(turn.userContent) : JSON.stringify(turn.userContent);
   const finalText =
-    turn.llmCalls.length > 0
-      ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content))
-      : "";
+    turn.llmCalls.length > 0 ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content)) : "";
 
-  // Per-turn author from the sender_id embedded in the user content; a batch
-  // may carry several senders — first is the userId, the rest ride metadata.
   const senders = extractSenderIds(
     typeof turn.userContent === "string" ? turn.userContent : JSON.stringify(turn.userContent),
   );
 
-  // Create or update the trace (upsert if traceId provided). Without a
-  // pre-allocated id, derive it from the user row's transcript uuid so
-  // re-ingesting the same transcript upserts instead of duplicating.
-  const trace = client.trace({
-    id: traceId || turn.userUuid || randomUUID(),
-    name: traceName,
-    sessionId,
-    userId: senders[0],
-    input: { role: "user", content: userText },
-    output: { role: "assistant", content: finalText },
-    tags: ["claude-code"],
-    metadata: {
-      source: "claude-code",
-      turn_number: turnNum,
-      transcript: transcriptName,
-      is_complete: turn.isComplete,
-      // The join key for "which chat message produced this trace" — the CLI's
-      // per-user-prompt id, matched against the runner's per-submission record.
-      ...(turn.promptId ? { prompt_id: turn.promptId } : {}),
-      ...(senders.length > 1 ? { other_senders: senders.slice(1) } : {}),
+  const traceIdHex = deriveTraceId(traceId || turn.userUuid || `${sessionId}:${turnNum}`);
+  idGenerator.queueTraceId(traceIdHex);
+
+  const turnStart = toDate(turn.userTimestamp);
+  const lastLlm = turn.llmCalls[turn.llmCalls.length - 1];
+  const turnEnd = lastLlm ? toDate(lastLlm.endTime) : turnStart;
+
+  // v5 observations-first model: correlating attributes propagate to every
+  // observation created in this scope — session cost then includes every
+  // cost-bearing generation.
+  propagateAttributes(
+    {
+      traceName,
+      sessionId,
+      ...(senders[0] ? { userId: senders[0] } : {}),
+      metadata: {
+        source: "claude-code",
+        turn_number: String(turnNum),
+        transcript: transcriptName,
+        is_complete: String(turn.isComplete),
+        ...(turn.promptId ? { prompt_id: turn.promptId } : {}),
+        ...(senders.length > 1 ? { other_senders: JSON.stringify(senders.slice(1)) } : {}),
+        ...(extraMetadata ?? {}),
+      },
     },
-  });
+    () => {
+      const root = startObservation(
+        traceName,
+        {
+          // Root-observation IO — the v5 replacement for deprecated trace IO.
+          input: { role: "user", content: userText },
+          output: { role: "assistant", content: finalText },
+        },
+        { asType: "agent", startTime: turnStart },
+      );
+      lastRootSpanContext = root.otelSpan.spanContext();
+      lastRootPropagation = { sessionId, ...(senders[0] ? { userId: senders[0] } : {}) };
 
-  for (let i = 0; i < turn.llmCalls.length; i++) {
-    emitLLMCall(
-      trace,
-      i + 1,
-      turn.llmCalls.length,
-      turn.llmCalls[i],
-      userText,
-      toolStartTimes,
-      promptRef,
-    );
-  }
+      for (let i = 0; i < turn.llmCalls.length; i++) {
+        emitLLMCall(
+          lastRootSpanContext,
+          i + 1,
+          turn.llmCalls.length,
+          turn.llmCalls[i],
+          userText,
+          toolStartTimes,
+          promptRef,
+        );
+      }
 
-  return trace.id;
+      root.end(turnEnd);
+    },
+  );
+
+  return traceIdHex;
 }
 
-/** Emit one LLM call as a generation with child tool spans. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+/**
+ * Emit one LLM call as a generation with child tool observations. The child
+ * method form (`parent.startObservation`) accepts no startTime — retrospective
+ * emission needs explicit timestamps, so children are created with the free
+ * function and an explicit parentSpanContext instead.
+ */
 function emitLLMCall(
-  trace: any,
+  parentCtx: SpanContext,
   index: number,
   total: number,
   llm: LLMCall,
@@ -241,99 +306,116 @@ function emitLLMCall(
 ): void {
   const genName = total > 1 ? `LLM Call ${index}/${total}` : "Claude Response";
 
-  // Build output preserving thinking blocks
   const text = truncate(extractText(llm.content));
   const thinking = extractThinking(llm.content);
   const output: Record<string, unknown> = { role: "assistant", text };
   if (thinking) output.thinking = truncate(thinking);
   if (llm.toolCalls.length > 0) {
-    output.tool_calls = llm.toolCalls.map((tc) => ({
-      name: tc.tool_use.name,
-      id: tc.tool_use.id,
-    }));
+    output.tool_calls = llm.toolCalls.map((tc) => ({ name: tc.tool_use.name, id: tc.tool_use.id }));
   }
 
-  const usage = buildUsage(llm.usage);
-
-  const gen = trace.generation({
-    // Deterministic: the API message id shared by this call's streaming chunks,
-    // so a re-ingest upserts. Undefined lets the SDK generate one.
-    id: llm.messageId,
-    name: genName,
-    model: llm.model,
-    input: { role: "user", content: userText },
-    output,
-    usage,
-    // langfuse@3 unwraps this to promptName/promptVersion and deliberately
-    // skips the link for a fallback prompt — isFallback must be false.
-    ...(promptRef ? { prompt: { name: promptRef.name, version: promptRef.version, isFallback: false } } : {}),
-    metadata: {
-      stop_reason: llm.stopReason ?? "",
-      timestamp: llm.endTime,
-      has_thinking: String(!!thinking),
-      ...(llm.usage.cache_read_input_tokens
-        ? { cache_read_input_tokens: llm.usage.cache_read_input_tokens }
-        : {}),
-      ...(llm.usage.cache_creation_input_tokens
-        ? { cache_creation_input_tokens: llm.usage.cache_creation_input_tokens }
-        : {}),
-      ...(llm.synthetic ? { synthetic: true } : {}),
+  const gen = startObservation(
+    genName,
+    {
+      model: llm.model,
+      input: { role: "user", content: userText },
+      output,
+      usageDetails: buildUsage(llm.usage),
+      ...(promptRef ? { prompt: { name: promptRef.name, version: promptRef.version, isFallback: false } } : {}),
+      metadata: {
+        stop_reason: llm.stopReason ?? "",
+        timestamp: llm.endTime,
+        has_thinking: String(!!thinking),
+        ...(llm.messageId ? { message_id: llm.messageId } : {}),
+        ...(llm.synthetic ? { synthetic: true } : {}),
+      },
     },
-    startTime: new Date(llm.startTime),
-    endTime: new Date(llm.endTime),
-  });
+    { asType: "generation", startTime: toDate(llm.startTime), parentSpanContext: parentCtx },
+  );
 
-  // Tool observations nested under this generation
+  const genCtx = gen.otelSpan.spanContext();
   for (const tc of llm.toolCalls) {
-    emitTool(gen, tc, toolStartTimes);
+    emitTool(genCtx, tc, toolStartTimes);
   }
 
-  gen.end();
+  gen.end(toDate(llm.endTime));
 }
 
-/** Emit one tool call as a span under its parent generation. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function emitTool(parent: any, tc: ToolCall, toolStartTimes?: Record<string, number>): void {
-  const toolInput = truncateValue(tc.tool_use.input);
-  const toolOutput = tc.result ? truncateValue(tc.result.content) : undefined;
-
+/** Emit one tool call as a tool-typed observation under its generation. */
+function emitTool(parentCtx: SpanContext, tc: ToolCall, toolStartTimes?: Record<string, number>): void {
   const meta: Record<string, unknown> = { tool_id: tc.tool_use.id };
-  if (tc.result?.durationMs !== undefined) {
-    meta.duration_ms = tc.result.durationMs;
-  }
-  if (tc.result?.timestamp) {
-    meta.timestamp = tc.result.timestamp;
-  }
-  if (tc.agentId) {
-    meta.agent_id = tc.agentId;
-  }
+  if (tc.result?.durationMs !== undefined) meta.duration_ms = tc.result.durationMs;
+  if (tc.result?.timestamp) meta.timestamp = tc.result.timestamp;
+  if (tc.agentId) meta.agent_id = tc.agentId;
 
-  // Use wall-clock start time from PreToolUse if available
   const wallClockStart = toolStartTimes?.[tc.tool_use.id];
   const startTime = wallClockStart ? new Date(wallClockStart) : undefined;
   const endTime = tc.result?.timestamp ? new Date(tc.result.timestamp) : undefined;
 
-  const span = parent.span({
-    // Deterministic: the model-minted tool_use_id, so a re-ingest upserts.
-    id: tc.tool_use.id,
-    name: `Tool: ${tc.tool_use.name}`,
-    input: toolInput,
-    output: toolOutput,
-    metadata: meta,
-    startTime,
-    endTime,
-  });
+  const span = startObservation(
+    `Tool: ${tc.tool_use.name}`,
+    {
+      input: truncateValue(tc.tool_use.input),
+      output: tc.result ? truncateValue(tc.result.content) : undefined,
+      metadata: meta,
+    },
+    { asType: "tool", parentSpanContext: parentCtx, ...(startTime ? { startTime } : {}) },
+  );
+  span.end(endTime);
+}
 
-  span.end();
+/**
+ * Emit one observation into an EXISTING trace by id — the OTLP replacement
+ * for v3's re-open-a-trace upsert (`client.trace({id, …})`), used by the
+ * StopFailure error marker and the PostCompact span. The observation parents
+ * onto a synthetic remote span context carrying the stored trace id: it lands
+ * in the right trace (rendered as a detached child) without competing with
+ * the turn's real root. With no trace id, it becomes a standalone root.
+ */
+export function emitDetachedObservation(options: {
+  traceId?: string;
+  name: string;
+  asType?: "event" | "span";
+  input?: unknown;
+  output?: unknown;
+  metadata?: Record<string, unknown>;
+  startTime?: Date;
+  endTime?: Date;
+  sessionId?: string;
+}): void {
+  if (!idGenerator) throw new Error("Langfuse tracing not initialized");
+  const opts: { startTime?: Date; parentSpanContext?: SpanContext } = {};
+  if (options.startTime) opts.startTime = options.startTime;
+  if (options.traceId) {
+    opts.parentSpanContext = {
+      traceId: deriveTraceId(options.traceId),
+      spanId: randomBytes(8).toString("hex"),
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    };
+  }
+  const emit = (): void => {
+    const attrs = { input: options.input, output: options.output, metadata: options.metadata };
+    // Overloads resolve on the asType LITERAL — a union doesn't narrow.
+    const obs =
+      options.asType === "span"
+        ? startObservation(options.name, attrs, { asType: "span", ...opts })
+        : startObservation(options.name, attrs, { asType: "event", ...opts });
+    obs.end(options.endTime);
+  };
+  if (options.sessionId) {
+    propagateAttributes({ sessionId: options.sessionId }, emit);
+  } else {
+    emit();
+  }
 }
 
 // ─── Interrupted turn recovery ──────────────────────────────────────────────
 
 /**
- * Close an interrupted turn (Stop never fired for it).
- * Traces any LLM calls from the transcript, updates the trace with error status.
- *
- * Used by UserPromptSubmit (on next prompt in same session) and SessionEnd.
+ * Close an interrupted turn (Stop never fired for it): emit whatever the
+ * transcript holds, tagged interrupted. Used by UserPromptSubmit (on next
+ * prompt in same session) and SessionEnd.
  */
 export async function closeInterruptedTurn(options: {
   sessionId: string;
@@ -343,29 +425,27 @@ export async function closeInterruptedTurn(options: {
 }): Promise<{ lastLine: number; turnsTraced: number; finalizedTraceId?: string }> {
   const { sessionId, sessionState, transcriptPath, config } = options;
 
-  if (!client) throw new Error("Langfuse client not initialized");
+  if (!idGenerator) throw new Error("Langfuse tracing not initialized");
 
   let lastLine = sessionState.last_line;
   let turnsTraced = 0;
+  let finalizedTraceId: string | undefined;
 
-  // Trace LLM calls from the transcript if available
   if (transcriptPath) {
     try {
-      const { messages, lastLine: newLastLine } = readTranscript(
-        transcriptPath,
-        sessionState.last_line,
-      );
+      const { messages, lastLine: newLastLine } = readTranscript(transcriptPath, sessionState.last_line);
       if (messages.length > 0) {
         const turns = groupIntoTurns(messages);
         if (turns.length > 0) {
           setMaxChars(config.maxChars);
-          emitTurn({
+          finalizedTraceId = emitTurn({
             sessionId,
             turnNum: sessionState.turn_count + 1,
             turn: turns[turns.length - 1],
             transcriptName: transcriptPath.split("/").pop() ?? "",
             traceId: sessionState.current_trace_id,
             toolStartTimes: sessionState.tool_start_times,
+            extraMetadata: { interrupted: "true", error: "User interrupt" },
           });
           lastLine = newLastLine;
           turnsTraced = 1;
@@ -376,28 +456,11 @@ export async function closeInterruptedTurn(options: {
     }
   }
 
-  // Update the trace with interrupt status
-  if (sessionState.current_trace_id) {
-    try {
-      client.trace({
-        id: sessionState.current_trace_id,
-        metadata: { interrupted: true, error: "User interrupt" },
-        tags: ["claude-code", "interrupted"],
-      });
-    } catch (err) {
-      logger.error(`Failed to update interrupted trace: ${err}`);
-    }
-  }
-
   await flushTraces();
 
   // ADR-008: interrupted turns count as substantive — caller writes this into
   // last_substantive_trace_id so /feedback can target them.
-  return {
-    lastLine,
-    turnsTraced,
-    finalizedTraceId: turnsTraced > 0 ? sessionState.current_trace_id : undefined,
-  };
+  return { lastLine, turnsTraced, finalizedTraceId: turnsTraced > 0 ? finalizedTraceId : undefined };
 }
 
 // ─── Subagent tracing ────────────────────────────────────────────────────────
@@ -410,8 +473,9 @@ export interface PendingSubagent {
 }
 
 /**
- * Trace pending subagents queued by SubagentStop.
- * Creates observations for each subagent's transcript under the parent trace.
+ * Trace pending subagents queued by SubagentStop, nested under the most
+ * recently emitted root observation (OTLP has no re-open-trace-by-id; the
+ * root's live span context is the parent handle).
  */
 export function tracePendingSubagents(options: {
   sessionId: string;
@@ -419,19 +483,31 @@ export function tracePendingSubagents(options: {
   taskRunMap: Record<string, { observation_id: string; deferred: Record<string, unknown> }>;
   parentTraceId: string | undefined;
 }): void {
-  const { pendingSubagents, taskRunMap, parentTraceId } = options;
+  const { sessionId, pendingSubagents, taskRunMap } = options;
 
-  if (!client) {
-    throw new Error("Langfuse client not initialized");
-  }
-
-  if (!parentTraceId) {
-    logger.warn("Cannot trace subagents: no parent trace ID");
+  if (!idGenerator) throw new Error("Langfuse tracing not initialized");
+  const parentCtx = lastRootSpanContext;
+  if (!parentCtx) {
+    logger.warn("Cannot trace subagents: no root observation emitted this invocation");
     return;
   }
 
-  const parentTrace = client.trace({ id: parentTraceId });
+  // Re-establish the turn's propagation scope: subagent generations are
+  // cost-bearing children of the same trace, and v5's observations-first
+  // model wants session/user on every one of them.
+  propagateAttributes(
+    { sessionId, ...(lastRootPropagation?.userId ? { userId: lastRootPropagation.userId } : {}) },
+    () => {
+      emitSubagents(pendingSubagents, taskRunMap, parentCtx);
+    },
+  );
+}
 
+function emitSubagents(
+  pendingSubagents: PendingSubagent[],
+  taskRunMap: Record<string, { observation_id: string; deferred: Record<string, unknown> }>,
+  parentCtx: SpanContext,
+): void {
   for (const subagent of pendingSubagents) {
     try {
       const taskRunInfo = taskRunMap[subagent.agent_id];
@@ -439,21 +515,20 @@ export function tracePendingSubagents(options: {
 
       logger.debug(`Processing subagent ${toolName} (${subagent.agent_id})`);
 
-      // If PostToolUse deferred an Agent tool span, create it now
       if (taskRunInfo?.deferred) {
         const def = taskRunInfo.deferred;
-        parentTrace.span({
-          id: taskRunInfo.observation_id,
-          name: `Tool: Agent (${toolName})`,
-          input: def.tool_input as Record<string, unknown>,
-          output: def.tool_output as Record<string, unknown>,
-          startTime: new Date(def.start_time as number),
-          endTime: new Date(def.end_time as number),
-          metadata: { agent_id: subagent.agent_id, agent_type: toolName },
-        });
+        const agentToolSpan = startObservation(
+          `Tool: Agent (${toolName})`,
+          {
+            input: def.tool_input as Record<string, unknown>,
+            output: def.tool_output as Record<string, unknown>,
+            metadata: { agent_id: subagent.agent_id, agent_type: toolName },
+          },
+          { asType: "tool", startTime: new Date(def.start_time as number), parentSpanContext: parentCtx },
+        );
+        agentToolSpan.end(new Date(def.end_time as number));
       }
 
-      // Read subagent transcript and trace its turns
       const { messages: subagentMessages } = readTranscript(subagent.agent_transcript_path, -1);
       if (subagentMessages.length === 0) {
         logger.debug(`Empty subagent transcript: ${subagent.agent_transcript_path}`);
@@ -462,48 +537,40 @@ export function tracePendingSubagents(options: {
 
       const subagentTurns = groupIntoTurns(subagentMessages);
 
-      // Create a grouping span for all subagent turns. Deterministic id from
-      // the agent_id so a re-ingest upserts the structure too.
-      const subagentSpan = parentTrace.span({
-        id: `${subagent.agent_id}-group`,
-        name: `${toolName} Subagent`,
-        metadata: {
-          agent_id: subagent.agent_id,
-          agent_type: toolName,
-          turns: subagentTurns.length,
-        },
-      });
+      const subagentSpan = startObservation(
+        `${toolName} Subagent`,
+        { metadata: { agent_id: subagent.agent_id, agent_type: toolName, turns: subagentTurns.length } },
+        { asType: "agent", parentSpanContext: parentCtx },
+      );
+      const subagentCtx = subagentSpan.otelSpan.spanContext();
 
       for (let i = 0; i < subagentTurns.length; i++) {
         const turn = subagentTurns[i];
         const userText =
-          typeof turn.userContent === "string"
-            ? truncate(turn.userContent)
-            : JSON.stringify(turn.userContent);
+          typeof turn.userContent === "string" ? truncate(turn.userContent) : JSON.stringify(turn.userContent);
         const finalText =
-          turn.llmCalls.length > 0
-            ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content))
-            : "";
+          turn.llmCalls.length > 0 ? truncate(extractText(turn.llmCalls[turn.llmCalls.length - 1].content)) : "";
 
-        const turnSpan = subagentSpan.span({
-          id: turn.userUuid ? `${subagent.agent_id}-turn-${turn.userUuid}` : undefined,
-          name: `Subagent Turn ${i + 1}`,
-          input: { role: "user", content: userText },
-          output: { role: "assistant", content: finalText },
-          metadata: { turn_number: i + 1 },
-        });
+        const turnSpan = startObservation(
+          `Subagent Turn ${i + 1}`,
+          {
+            input: { role: "user", content: userText },
+            output: { role: "assistant", content: finalText },
+            metadata: { turn_number: i + 1 },
+          },
+          { parentSpanContext: subagentCtx },
+        );
+        const turnCtx = turnSpan.otelSpan.spanContext();
 
         for (let j = 0; j < turn.llmCalls.length; j++) {
-          emitLLMCall(turnSpan, j + 1, turn.llmCalls.length, turn.llmCalls[j], userText);
+          emitLLMCall(turnCtx, j + 1, turn.llmCalls.length, turn.llmCalls[j], userText);
         }
 
         turnSpan.end();
       }
 
       subagentSpan.end();
-      logger.log(
-        `Traced subagent ${toolName} (${subagent.agent_id}): ${subagentTurns.length} turn(s)`,
-      );
+      logger.log(`Traced subagent ${toolName} (${subagent.agent_id}): ${subagentTurns.length} turn(s)`);
     } catch (err) {
       logger.error(`Failed to trace subagent ${subagent.agent_id}: ${err}`);
     }

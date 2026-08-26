@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);
 
 // dist/logger.js
 import { appendFileSync, mkdirSync, statSync, renameSync } from "node:fs";

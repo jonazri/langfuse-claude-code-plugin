@@ -8,7 +8,7 @@
  */
 
 import { error, debug } from "../logger.js";
-import { initClient, flushTraces, shutdownClient } from "../langfuse.js";
+import { initClient, emitDetachedObservation, flushTraces, shutdownClient } from "../langfuse.js";
 import { loadState, atomicUpdateState, getSessionState } from "../state.js";
 import { initHook } from "../utils/hook-init.js";
 import { readStdin } from "../utils/stdin.js";
@@ -39,22 +39,22 @@ async function main(): Promise<void> {
     return;
   }
 
-  const langfuse = initClient(config.publicKey, config.secretKey, config.baseUrl);
+  initClient(config.publicKey, config.secretKey, config.baseUrl);
   const errorMessage = input.error_details ? `${input.error}: ${input.error_details}` : input.error;
 
   try {
-    langfuse.trace({
-      id: sessionState.current_trace_id,
+    // OTLP has no trace upsert — record the failure as a detached event
+    // observation inside the turn's trace.
+    emitDetachedObservation({
+      traceId: sessionState.current_trace_id,
+      name: "Stop failure",
       output: { error: errorMessage },
-      metadata: {
-        error: errorMessage,
-        turn_number: sessionState.current_turn_number,
-      },
-      tags: ["claude-code", "error"],
+      metadata: { error: errorMessage, turn_number: sessionState.current_turn_number },
+      sessionId: input.session_id,
     });
-    debug(`Updated trace ${sessionState.current_trace_id} with error: ${errorMessage}`);
+    debug(`Recorded error event in trace ${sessionState.current_trace_id}: ${errorMessage}`);
   } catch (err) {
-    error(`Failed to update trace on StopFailure: ${err}`);
+    error(`Failed to record StopFailure event: ${err}`);
   }
 
   await atomicUpdateState(config.stateFilePath, (s) => {

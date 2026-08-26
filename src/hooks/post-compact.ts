@@ -7,7 +7,7 @@
  */
 
 import { debug, error } from "../logger.js";
-import { initClient, flushTraces, shutdownClient } from "../langfuse.js";
+import { initClient, emitDetachedObservation, flushTraces, shutdownClient } from "../langfuse.js";
 import { loadState, atomicUpdateState, getSessionState } from "../state.js";
 import { initHook } from "../utils/hook-init.js";
 import { readStdin } from "../utils/stdin.js";
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
 
   debug(`PostCompact hook started, session=${input.session_id}, trigger=${input.trigger}`);
 
-  const langfuse = initClient(config.publicKey, config.secretKey, config.baseUrl);
+  initClient(config.publicKey, config.secretKey, config.baseUrl);
 
   const state = loadState(config.stateFilePath);
   const sessionState = getSessionState(state, input.session_id);
@@ -37,44 +37,27 @@ async function main(): Promise<void> {
   const endTime = Date.now();
   const startTime = sessionState.compaction_start_time ?? endTime;
 
-  // If there's an active trace, add compaction as a child span.
-  // Otherwise, create a standalone trace for the compaction event.
-  if (sessionState.current_trace_id) {
-    try {
-      const trace = langfuse.trace({ id: sessionState.current_trace_id });
-      const span = trace.span({
-        name: `Context Compaction (${input.trigger})`,
-        input: {},
-        output: { compact_summary: input.compact_summary },
-        startTime: new Date(startTime),
-        endTime: new Date(endTime),
-        metadata: {
-          trigger: input.trigger,
-          session_id: input.session_id,
-        },
-      });
-      span.end();
-      debug(`Created compaction span under trace ${sessionState.current_trace_id}`);
-    } catch (err) {
-      error(`Failed to create compaction span: ${err}`);
-    }
-  } else {
-    try {
-      langfuse.trace({
-        name: `Context Compaction (${input.trigger})`,
-        sessionId: input.session_id,
-        input: {},
-        output: { compact_summary: input.compact_summary },
-        tags: ["claude-code", "compaction"],
-        metadata: {
-          source: "claude-code",
-          trigger: input.trigger,
-        },
-      });
-      debug(`Created standalone compaction trace`);
-    } catch (err) {
-      error(`Failed to create compaction trace: ${err}`);
-    }
+  // Detached span in the open trace when one exists; standalone root
+  // otherwise (OTLP has no re-open-a-trace upsert).
+  try {
+    emitDetachedObservation({
+      traceId: sessionState.current_trace_id,
+      name: `Context Compaction (${input.trigger})`,
+      asType: "span",
+      input: {},
+      output: { compact_summary: input.compact_summary },
+      metadata: { source: "claude-code", trigger: input.trigger, session_id: input.session_id },
+      startTime: new Date(startTime),
+      endTime: new Date(endTime),
+      sessionId: input.session_id,
+    });
+    debug(
+      sessionState.current_trace_id
+        ? `Created compaction span under trace ${sessionState.current_trace_id}`
+        : "Created standalone compaction observation",
+    );
+  } catch (err) {
+    error(`Failed to record compaction: ${err}`);
   }
 
   // Clear compaction_start_time from state

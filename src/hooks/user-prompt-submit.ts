@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { debug, error } from "../logger.js";
 import { initClient, closeInterruptedTurn, flushTraces, setMaxChars } from "../langfuse.js";
+import { deriveTraceId } from "../otel-exporter.js";
 import { loadState, atomicUpdateState, getSessionState, setActiveByCwd } from "../state.js";
 import { getTranscriptEndLine } from "../transcript.js";
 import { initHook, expandHome } from "../utils/hook-init.js";
@@ -66,7 +67,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  const langfuse = initClient(config.publicKey, config.secretKey, config.baseUrl);
+  initClient(config.publicKey, config.secretKey, config.baseUrl);
   setMaxChars(config.maxChars);
 
   const state = loadState(config.stateFilePath);
@@ -102,22 +103,12 @@ async function main(): Promise<void> {
   }
 
   const turnNum = sessionState.turn_count + interruptedTurnsTraced + 1;
-  const traceId = randomUUID();
+  // v5/OTLP: mint the deterministic 32-hex trace id locally — no eager shell
+  // trace (OTLP has no partial-trace upsert; the turn appears at Stop, and v4
+  // ingestion is real-time so the old eager-create latency win is gone).
+  const traceId = deriveTraceId(randomUUID());
 
-  // Create the trace eagerly so it appears in Langfuse immediately
-  langfuse.trace({
-    id: traceId,
-    name: `Claude Code - Turn ${turnNum}`,
-    sessionId: input.session_id,
-    input: { role: "user", content: input.prompt },
-    tags: ["claude-code"],
-    metadata: {
-      source: "claude-code",
-      turn_number: turnNum,
-    },
-  });
-
-  debug(`Created trace ${traceId} for turn ${turnNum}`);
+  debug(`Allocated trace id ${traceId} for turn ${turnNum}`);
 
   await flushTraces();
 

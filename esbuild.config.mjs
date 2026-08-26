@@ -26,6 +26,11 @@ await build({
   outbase: "dist",
   // Mark node builtins as external (they're available at runtime)
   external: ["node:*"],
+  // The OTEL packages are CJS and require() bare builtins ("util", "os"),
+  // which an ESM bundle cannot service — shim require via createRequire.
+  banner: {
+    js: 'import { createRequire as __createRequire } from "node:module"; const require = __createRequire(import.meta.url);',
+  },
 });
 
 // Make bundles executable.
